@@ -1,4 +1,4 @@
-export function createSseClient({ onTrack, onConnect, onDisconnect, onHeartbeat }) {
+export function createSseClient({ onTrack, onAlert, onConnect, onDisconnect, onHeartbeat }) {
   let eventSource = null
   let reconnectTimer = null
   let isManualClose = false
@@ -24,6 +24,16 @@ export function createSseClient({ onTrack, onConnect, onDisconnect, onHeartbeat 
           onTrack && onTrack(track)
         } catch (e) {
           console.error('[SSE] Parse track error:', e)
+        }
+      })
+
+      eventSource.addEventListener('alert', (event) => {
+        try {
+          const alert = JSON.parse(event.data)
+          console.warn('[SSE] Alert received:', alert)
+          onAlert && onAlert(alert)
+        } catch (e) {
+          console.error('[SSE] Parse alert error:', e)
         }
       })
 

@@ -44,6 +44,44 @@
       </div>
     </div>
 
+    <div class="stats-section" v-if="totalActiveAlerts > 0">
+      <h4 class="section-title" :class="{ 'alert-title': highestAlertSeverity === 'CRITICAL' }">
+        <el-icon v-if="highestAlertSeverity === 'CRITICAL'" class="title-icon"><Warning /></el-icon>
+        告警统计
+      </h4>
+      <div class="alert-overview" :class="`severity-${highestAlertSeverity}`">
+        <div class="alert-icon-wrap">
+          <el-icon :size="32"><Bell /></el-icon>
+        </div>
+        <div class="alert-info">
+          <span class="alert-total">{{ totalActiveAlerts }}</span>
+          <span class="alert-label">活跃告警</span>
+        </div>
+      </div>
+      <div class="alert-breakdown">
+        <div class="alert-level" v-if="criticalAlerts > 0">
+          <span class="level-dot critical"></span>
+          <span class="level-label">紧急</span>
+          <span class="level-count">{{ criticalAlerts }}</span>
+        </div>
+        <div class="alert-level" v-if="highAlerts > 0">
+          <span class="level-dot high"></span>
+          <span class="level-label">高</span>
+          <span class="level-count">{{ highAlerts }}</span>
+        </div>
+        <div class="alert-level" v-if="mediumAlerts > 0">
+          <span class="level-dot medium"></span>
+          <span class="level-label">中</span>
+          <span class="level-count">{{ mediumAlerts }}</span>
+        </div>
+        <div class="alert-level" v-if="lowAlerts > 0">
+          <span class="level-dot low"></span>
+          <span class="level-label">低</span>
+          <span class="level-count">{{ lowAlerts }}</span>
+        </div>
+      </div>
+    </div>
+
     <div class="stats-section">
       <h4 class="section-title">高度分布</h4>
       <div class="altitude-bars">
@@ -95,7 +133,7 @@
 
 <script setup>
 import { computed } from 'vue'
-import { Promotion, DataLine, Connection, Histogram } from '@element-plus/icons-vue'
+import { Promotion, DataLine, Connection, Histogram, Warning, Bell } from '@element-plus/icons-vue'
 import { getSourceLabel } from '../utils/format'
 
 const props = defineProps({
@@ -106,6 +144,10 @@ const props = defineProps({
   connected: {
     type: Boolean,
     default: false
+  },
+  alerts: {
+    type: Map,
+    default: () => new Map()
   }
 })
 
@@ -151,6 +193,25 @@ const sourceDistribution = computed(() => {
     dist[s] = (dist[s] || 0) + 1
   })
   return dist
+})
+
+const alertList = computed(() => Array.from(props.alerts.values()))
+
+const activeAlerts = computed(() => alertList.value.filter(a => a.status === 'ACTIVE'))
+
+const criticalAlerts = computed(() => activeAlerts.value.filter(a => a.severity === 'CRITICAL').length)
+const highAlerts = computed(() => activeAlerts.value.filter(a => a.severity === 'HIGH').length)
+const mediumAlerts = computed(() => activeAlerts.value.filter(a => a.severity === 'MEDIUM').length)
+const lowAlerts = computed(() => activeAlerts.value.filter(a => a.severity === 'LOW').length)
+
+const totalActiveAlerts = computed(() => activeAlerts.value.length)
+
+const highestAlertSeverity = computed(() => {
+  if (criticalAlerts.value > 0) return 'CRITICAL'
+  if (highAlerts.value > 0) return 'HIGH'
+  if (mediumAlerts.value > 0) return 'MEDIUM'
+  if (lowAlerts.value > 0) return 'LOW'
+  return null
 })
 </script>
 
@@ -333,6 +394,150 @@ const sourceDistribution = computed(() => {
   font-size: 13px;
   font-weight: 600;
   color: #00d4ff;
+  font-family: Consolas, monospace;
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.section-title.alert-title {
+  color: #ff4d4d;
+  animation: title-blink 1s infinite;
+}
+
+@keyframes title-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+.title-icon {
+  animation: icon-shake 0.5s infinite;
+}
+
+@keyframes icon-shake {
+  0%, 100% { transform: rotate(-5deg); }
+  50% { transform: rotate(5deg); }
+}
+
+.alert-overview {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px;
+  border-radius: 8px;
+  margin-bottom: 12px;
+  border: 1px solid;
+}
+
+.alert-overview.severity-CRITICAL {
+  background: linear-gradient(135deg, rgba(255, 77, 77, 0.15), rgba(255, 77, 77, 0.05));
+  border-color: #ff4d4d;
+  animation: overview-pulse 1s infinite;
+}
+
+@keyframes overview-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 77, 77, 0.3); }
+  50% { box-shadow: 0 0 16px 2px rgba(255, 77, 77, 0.5); }
+}
+
+.alert-overview.severity-HIGH {
+  background: linear-gradient(135deg, rgba(255, 153, 77, 0.15), rgba(255, 153, 77, 0.05));
+  border-color: #ff994d;
+}
+
+.alert-overview.severity-MEDIUM {
+  background: linear-gradient(135deg, rgba(255, 204, 0, 0.15), rgba(255, 204, 0, 0.05));
+  border-color: #ffcc00;
+}
+
+.alert-overview.severity-LOW {
+  background: linear-gradient(135deg, rgba(77, 150, 255, 0.15), rgba(77, 150, 255, 0.05));
+  border-color: #4d96ff;
+}
+
+.alert-icon-wrap {
+  width: 56px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.severity-CRITICAL .alert-icon-wrap { color: #ff4d4d; }
+.severity-HIGH .alert-icon-wrap { color: #ff994d; }
+.severity-MEDIUM .alert-icon-wrap { color: #ffcc00; }
+.severity-LOW .alert-icon-wrap { color: #4d96ff; }
+
+.alert-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.alert-total {
+  font-size: 32px;
+  font-weight: 700;
+  color: #fff;
+  font-family: Consolas, monospace;
+  line-height: 1;
+}
+
+.alert-label {
+  font-size: 12px;
+  color: #8892a6;
+  margin-top: 4px;
+}
+
+.alert-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.alert-level {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #141b2a;
+  border-radius: 4px;
+  border: 1px solid #1e2a3f;
+}
+
+.level-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.level-dot.critical {
+  background: #ff4d4d;
+  animation: dot-blink 0.5s infinite;
+}
+
+@keyframes dot-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.level-dot.high { background: #ff994d; }
+.level-dot.medium { background: #ffcc00; }
+.level-dot.low { background: #4d96ff; }
+
+.level-label {
+  flex: 1;
+  font-size: 12px;
+  color: #c0c8d4;
+}
+
+.level-count {
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
   font-family: Consolas, monospace;
 }
 </style>

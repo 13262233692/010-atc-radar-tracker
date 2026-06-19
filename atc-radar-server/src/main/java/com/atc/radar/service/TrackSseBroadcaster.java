@@ -1,5 +1,6 @@
 package com.atc.radar.service;
 
+import com.atc.radar.model.AlertEvent;
 import com.atc.radar.model.TrackData;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -147,5 +148,44 @@ public class TrackSseBroadcaster {
 
     public int getConnectedClients() {
         return clientCount.get();
+    }
+
+    public void broadcastAlert(AlertEvent alert) {
+        if (emitterList.isEmpty()) {
+            return;
+        }
+
+        String eventData;
+        try {
+            eventData = objectMapper.writeValueAsString(alert);
+        } catch (Exception e) {
+            log.error("Failed to serialize alert data: {}", e.getMessage());
+            return;
+        }
+
+        SseEmitter.SseEventBuilder event = SseEmitter.event()
+                .name("alert")
+                .data(eventData);
+
+        List<SseEmitter> failed = null;
+
+        for (SseEmitter emitter : emitterList) {
+            try {
+                emitter.send(event);
+            } catch (IOException e) {
+                if (failed == null) {
+                    failed = new ArrayList<>(4);
+                }
+                failed.add(emitter);
+            }
+        }
+
+        if (failed != null) {
+            for (SseEmitter failedEmitter : failed) {
+                evictEmitter(failedEmitter);
+            }
+        }
+
+        log.debug("Broadcast alert {} to {} clients", alert.getAlertId(), clientCount.get());
     }
 }
