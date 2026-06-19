@@ -13,11 +13,12 @@ import org.springframework.stereotype.Service;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.stream.Collectors;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.StampedLock;
 
 @Slf4j
 @Service
@@ -32,7 +33,13 @@ public class TrackService {
     private final AtcRadarProperties properties;
     private final TrackSseBroadcaster sseBroadcaster;
 
-    private final ConcurrentMap<String, TrackData> localCache = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, TrackData> localCache = new ConcurrentHashMap<>(512, 0.75f, 64);
+
+    private final AtomicReference<List<TrackData>> snapshotRef = new AtomicReference<>(Collections.emptyList());
+    private final StampedLock snapshotLock = new StampedLock();
+    private volatile long snapshotVersion = 0;
+    private volatile long lastSnapshotBuildTime = 0;
+    private static final long SNAPSHOT_MIN_INTERVAL_MS = 200;
 
     public void updateTrack(TrackData track) {
         if (track == null || track.getTrackId() == null) {
@@ -44,21 +51,26 @@ public class TrackService {
             track.setStatus(TrackData.TrackStatus.ACTIVE);
         }
 
-        TrackData existing = localCache.get(track.getTrackId());
-        if (existing != null) {
-            if (track.getCallsign() == null) track.setCallsign(existing.getCallsign());
-            if (track.getTargetAddress() == null) track.setTargetAddress(existing.getTargetAddress());
-            if (track.getAltitude() == null) track.setAltitude(existing.getAltitude());
-            if (track.getHeading() == null) track.setHeading(existing.getHeading());
-            if (track.getGroundSpeed() == null) track.setGroundSpeed(existing.getGroundSpeed());
-            if (track.getVerticalRate() == null) track.setVerticalRate(existing.getVerticalRate());
-        }
+        final String trackId = track.getTrackId();
 
-        localCache.put(track.getTrackId(), track);
+        localCache.compute(trackId, (key, existing) -> {
+            if (existing != null) {
+                if (track.getCallsign() == null) track.setCallsign(existing.getCallsign());
+                if (track.getTargetAddress() == null) track.setTargetAddress(existing.getTargetAddress());
+                if (track.getAltitude() == null) track.setAltitude(existing.getAltitude());
+                if (track.getHeading() == null) track.setHeading(existing.getHeading());
+                if (track.getGroundSpeed() == null) track.setGroundSpeed(existing.getGroundSpeed());
+                if (track.getVerticalRate() == null) track.setVerticalRate(existing.getVerticalRate());
+            }
+            return track;
+        });
+
+        snapshotVersion++;
+
         saveToRedis(track);
         sseBroadcaster.broadcast(track);
 
-        log.debug("Updated track: {}", track.getTrackId());
+        log.debug("Updated track: {}", trackId);
     }
 
     private void saveToRedis(TrackData track) {
@@ -82,8 +94,9 @@ public class TrackService {
             String key = TRACK_KEY_PREFIX + trackId;
             Object obj = redisTemplate.opsForValue().get(key);
             if (obj != null) {
-                track = objectMapper.convertValue(obj, new TypeReference<>() {});
+                track = objectMapper.convertValue(obj, new TypeReference<TrackData>() {});
                 localCache.put(trackId, track);
+                snapshotVersion++;
             }
         } catch (Exception e) {
             log.warn("Failed to get track from Redis: {}", e.getMessage());
@@ -93,42 +106,50 @@ public class TrackService {
     }
 
     public List<TrackData> getAllTracks() {
-        List<TrackData> tracks = new ArrayList<>(localCache.values());
-
-        if (tracks.isEmpty()) {
-            try {
-                Set<Object> trackIds = redisTemplate.opsForSet().members(TRACK_SET_KEY);
-                if (trackIds != null && !trackIds.isEmpty()) {
-                    for (Object idObj : trackIds) {
-                        String trackId = String.valueOf(idObj);
-                        TrackData track = getTrack(trackId);
-                        if (track != null) {
-                            tracks.add(track);
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                log.warn("Failed to get all tracks from Redis: {}", e.getMessage());
-            }
+        long now = System.currentTimeMillis();
+        if (now - lastSnapshotBuildTime > SNAPSHOT_MIN_INTERVAL_MS) {
+            rebuildSnapshot();
         }
+        List<TrackData> snapshot = snapshotRef.get();
+        return snapshot;
+    }
 
-        return tracks.stream()
-                .filter(t -> t.getStatus() != TrackData.TrackStatus.DROPPED)
-                .collect(Collectors.toList());
+    private void rebuildSnapshot() {
+        long stamp = snapshotLock.tryWriteLock();
+        if (stamp == 0) {
+            return;
+        }
+        try {
+            List<TrackData> result = new ArrayList<>(localCache.size());
+            localCache.forEachValue(64, track -> {
+                if (track.getStatus() != TrackData.TrackStatus.DROPPED) {
+                    result.add(track);
+                }
+            });
+            snapshotRef.set(Collections.unmodifiableList(result));
+            lastSnapshotBuildTime = System.currentTimeMillis();
+        } finally {
+            snapshotLock.unlockWrite(stamp);
+        }
     }
 
     @Scheduled(fixedRate = 60000)
     public void cleanupExpiredTracks() {
         Instant now = Instant.now();
         Duration ttl = Duration.ofSeconds(properties.getTrack().getTtlSeconds());
+        List<String> expiredIds = new ArrayList<>();
 
-        List<String> expiredIds = localCache.entrySet().stream()
-                .filter(e -> Duration.between(e.getValue().getLastUpdate(), now).compareTo(ttl) > 0)
-                .map(e -> {
-                    e.getValue().setStatus(TrackData.TrackStatus.DROPPED);
-                    return e.getKey();
-                })
-                .collect(Collectors.toList());
+        localCache.forEach(64, (id, track) -> {
+            if (track.getLastUpdate() != null
+                    && Duration.between(track.getLastUpdate(), now).compareTo(ttl) > 0) {
+                track.setStatus(TrackData.TrackStatus.DROPPED);
+                expiredIds.add(id);
+            }
+        });
+
+        if (expiredIds.isEmpty()) {
+            return;
+        }
 
         for (String id : expiredIds) {
             localCache.remove(id);
@@ -140,18 +161,22 @@ public class TrackService {
             }
         }
 
-        if (!expiredIds.isEmpty()) {
-            log.info("Cleaned up {} expired tracks", expiredIds.size());
-        }
+        snapshotVersion++;
+        log.info("Cleaned up {} expired tracks", expiredIds.size());
     }
 
     public void removeTrack(String trackId) {
         localCache.remove(trackId);
+        snapshotVersion++;
         try {
             redisTemplate.delete(TRACK_KEY_PREFIX + trackId);
             redisTemplate.opsForSet().remove(TRACK_SET_KEY, trackId);
         } catch (Exception e) {
             log.warn("Failed to remove track from Redis: {}", e.getMessage());
         }
+    }
+
+    public int getActiveTrackCount() {
+        return localCache.size();
     }
 }

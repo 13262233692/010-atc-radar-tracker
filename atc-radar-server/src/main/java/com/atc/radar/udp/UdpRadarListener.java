@@ -6,21 +6,22 @@ import com.atc.radar.model.TrackData;
 import com.atc.radar.service.TrackService;
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class UdpRadarListener {
+
+    private static final int RING_BUFFER_SIZE = 16384;
+    private static final int RING_BUFFER_MASK = RING_BUFFER_SIZE - 1;
 
     private final AtcRadarProperties properties;
     private final AsterixParser asterixParser;
@@ -28,8 +29,25 @@ public class UdpRadarListener {
 
     private DatagramSocket socket;
     private final AtomicBoolean running = new AtomicBoolean(false);
-    private ExecutorService executorService;
     private Thread listenerThread;
+
+    private final AtomicLong writeSequence = new AtomicLong(0);
+    private final AtomicLong readSequence = new AtomicLong(0);
+    private final byte[][] ringBuffer = new byte[RING_BUFFER_SIZE][];
+    private final int[] ringBufferLengths = new int[RING_BUFFER_SIZE];
+
+    private ExecutorService parseExecutor;
+    private ExecutorService updateExecutor;
+
+    private final AtomicLong packetsReceived = new AtomicLong(0);
+    private final AtomicLong packetsDropped = new AtomicLong(0);
+    private final AtomicLong tracksProcessed = new AtomicLong(0);
+
+    public UdpRadarListener(AtcRadarProperties properties, AsterixParser asterixParser, TrackService trackService) {
+        this.properties = properties;
+        this.asterixParser = asterixParser;
+        this.trackService = trackService;
+    }
 
     @PostConstruct
     public void start() {
@@ -38,15 +56,32 @@ public class UdpRadarListener {
             socket = new DatagramSocket(port);
             socket.setReceiveBufferSize(properties.getUdp().getBufferSize());
 
-            executorService = Executors.newFixedThreadPool(4);
+            parseExecutor = new ThreadPoolExecutor(
+                    Runtime.getRuntime().availableProcessors(),
+                    Runtime.getRuntime().availableProcessors() * 2,
+                    60L, TimeUnit.SECONDS,
+                    new LinkedBlockingQueue<>(4096),
+                    new ThreadPoolExecutor.DiscardOldestPolicy()
+            );
+
+            updateExecutor = Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "Track-Update-Processor");
+                t.setDaemon(true);
+                return t;
+            });
+
             running.set(true);
 
             listenerThread = new Thread(this::listenLoop, "UDP-Radar-Listener");
             listenerThread.setDaemon(true);
             listenerThread.start();
 
-            log.info("UDP Radar Listener started on port: {}, buffer size: {}",
-                    port, properties.getUdp().getBufferSize());
+            Thread consumerThread = new Thread(this::consumeLoop, "Ring-Buffer-Consumer");
+            consumerThread.setDaemon(true);
+            consumerThread.start();
+
+            log.info("UDP Radar Listener started on port: {}, buffer size: {}, ring buffer: {}",
+                    port, properties.getUdp().getBufferSize(), RING_BUFFER_SIZE);
         } catch (Exception e) {
             log.error("Failed to start UDP Radar Listener: {}", e.getMessage(), e);
         }
@@ -58,13 +93,17 @@ public class UdpRadarListener {
         if (socket != null && !socket.isClosed()) {
             socket.close();
         }
-        if (executorService != null) {
-            executorService.shutdownNow();
+        if (parseExecutor != null) {
+            parseExecutor.shutdownNow();
+        }
+        if (updateExecutor != null) {
+            updateExecutor.shutdownNow();
         }
         if (listenerThread != null) {
             listenerThread.interrupt();
         }
-        log.info("UDP Radar Listener stopped");
+        log.info("UDP Radar Listener stopped. Stats: received={}, dropped={}, tracks={}",
+                packetsReceived.get(), packetsDropped.get(), tracksProcessed.get());
     }
 
     private void listenLoop() {
@@ -75,13 +114,24 @@ public class UdpRadarListener {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 socket.receive(packet);
 
-                byte[] data = new byte[packet.getLength()];
-                System.arraycopy(packet.getData(), packet.getOffset(), data, 0, packet.getLength());
+                int length = packet.getLength();
+                long currentWrite = writeSequence.get();
+                long currentRead = readSequence.get();
 
-                log.debug("Received UDP packet from {}:{}, length={}",
-                        packet.getAddress(), packet.getPort(), data.length);
+                if (currentWrite - currentRead >= RING_BUFFER_SIZE) {
+                    packetsDropped.incrementAndGet();
+                    log.debug("Ring buffer full, dropping packet. Write={}, Read={}", currentWrite, currentRead);
+                    continue;
+                }
 
-                executorService.submit(() -> processPacket(data));
+                int slot = (int) (currentWrite & RING_BUFFER_MASK);
+                byte[] data = new byte[length];
+                System.arraycopy(packet.getData(), packet.getOffset(), data, 0, length);
+                ringBuffer[slot] = data;
+                ringBufferLengths[slot] = length;
+
+                writeSequence.lazySet(currentWrite + 1);
+                packetsReceived.incrementAndGet();
 
             } catch (java.net.SocketException e) {
                 if (running.get()) {
@@ -91,7 +141,7 @@ public class UdpRadarListener {
             } catch (Exception e) {
                 log.error("Error receiving UDP packet: {}", e.getMessage(), e);
                 try {
-                    Thread.sleep(100);
+                    Thread.sleep(10);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     break;
@@ -100,14 +150,39 @@ public class UdpRadarListener {
         }
     }
 
+    private void consumeLoop() {
+        while (running.get() && !Thread.currentThread().isInterrupted()) {
+            long currentRead = readSequence.get();
+            long currentWrite = writeSequence.get();
+
+            if (currentRead >= currentWrite) {
+                Thread.yield();
+                continue;
+            }
+
+            int slot = (int) (currentRead & RING_BUFFER_MASK);
+            byte[] data = ringBuffer[slot];
+            int length = ringBufferLengths[slot];
+            ringBuffer[slot] = null;
+
+            readSequence.lazySet(currentRead + 1);
+
+            if (data != null && length > 0) {
+                parseExecutor.submit(() -> processPacket(data));
+            }
+        }
+    }
+
     private void processPacket(byte[] data) {
         try {
             List<TrackData> tracks = asterixParser.parse(data);
             if (!tracks.isEmpty()) {
-                log.debug("Parsed {} track(s) from UDP packet", tracks.size());
-                for (TrackData track : tracks) {
-                    trackService.updateTrack(track);
-                }
+                tracksProcessed.addAndGet(tracks.size());
+                updateExecutor.submit(() -> {
+                    for (TrackData track : tracks) {
+                        trackService.updateTrack(track);
+                    }
+                });
             }
         } catch (Exception e) {
             log.error("Error processing UDP packet: {}", e.getMessage(), e);

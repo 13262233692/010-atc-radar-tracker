@@ -48,7 +48,7 @@ public class TrackController {
     @GetMapping("/stats")
     public ResponseEntity<Map<String, Object>> getStats() {
         Map<String, Object> stats = new HashMap<>();
-        stats.put("activeTracks", trackService.getAllTracks().size());
+        stats.put("activeTracks", trackService.getActiveTrackCount());
         stats.put("connectedClients", sseBroadcaster.getConnectedClients());
         return ResponseEntity.ok(stats);
     }

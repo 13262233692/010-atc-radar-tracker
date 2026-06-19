@@ -2,54 +2,66 @@ package com.atc.radar.service;
 
 import com.atc.radar.model.TrackData;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class TrackSseBroadcaster {
 
-    private final Map<String, SseEmitter> emitters = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, SseEmitter> emitterRegistry = new ConcurrentHashMap<>(32);
+    private final CopyOnWriteArrayList<SseEmitter> emitterList = new CopyOnWriteArrayList<>();
     private final ObjectMapper objectMapper;
+    private final AtomicInteger clientCount = new AtomicInteger(0);
+
+    public TrackSseBroadcaster(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
 
     public SseEmitter createEmitter(String clientId) {
         SseEmitter emitter = new SseEmitter(0L);
-        emitter.onCompletion(() -> {
-            emitters.remove(clientId);
-            log.debug("SSE connection completed: {}", clientId);
-        });
-        emitter.onTimeout(() -> {
-            emitters.remove(clientId);
-            log.debug("SSE connection timeout: {}", clientId);
-        });
-        emitter.onError(e -> {
-            emitters.remove(clientId);
-            log.debug("SSE connection error: {} - {}", clientId, e.getMessage());
-        });
 
-        emitters.put(clientId, emitter);
-        log.info("New SSE client connected: {}, total: {}", clientId, emitters.size());
+        emitter.onCompletion(() -> removeEmitter(clientId, emitter, "completed"));
+        emitter.onTimeout(() -> removeEmitter(clientId, emitter, "timeout"));
+        emitter.onError(e -> removeEmitter(clientId, emitter, "error: " + e.getMessage()));
+
+        emitterRegistry.put(clientId, emitter);
+        emitterList.add(emitter);
+        clientCount.incrementAndGet();
+
+        log.info("SSE client connected: {}, total: {}", clientId, clientCount.get());
 
         try {
             emitter.send(SseEmitter.event()
                     .name("connected")
                     .data("{\"status\":\"connected\",\"clientId\":\"" + clientId + "\"}"));
         } catch (IOException e) {
-            log.warn("Failed to send connect event: {}", e.getMessage());
+            removeEmitter(clientId, emitter, "initial_send_failed");
         }
 
         return emitter;
     }
 
+    private void removeEmitter(String clientId, SseEmitter emitter, String reason) {
+        boolean removed = emitterRegistry.remove(clientId, emitter);
+        if (removed) {
+            emitterList.remove(emitter);
+            clientCount.decrementAndGet();
+            log.debug("SSE disconnected: {} ({})", clientId, reason);
+        }
+    }
+
     public void broadcast(TrackData track) {
-        if (emitters.isEmpty()) {
+        if (emitterList.isEmpty()) {
             return;
         }
 
@@ -65,20 +77,28 @@ public class TrackSseBroadcaster {
                 .name("track")
                 .data(eventData);
 
-        emitters.entrySet().removeIf(entry -> {
+        List<SseEmitter> failed = null;
+
+        for (SseEmitter emitter : emitterList) {
             try {
-                entry.getValue().send(event);
-                return false;
+                emitter.send(event);
             } catch (IOException e) {
-                log.debug("Failed to send SSE event to client {}: {}", entry.getKey(), e.getMessage());
-                entry.getValue().completeWithError(e);
-                return true;
+                if (failed == null) {
+                    failed = new ArrayList<>(4);
+                }
+                failed.add(emitter);
             }
-        });
+        }
+
+        if (failed != null) {
+            for (SseEmitter failedEmitter : failed) {
+                evictEmitter(failedEmitter);
+            }
+        }
     }
 
     public void broadcastHeartbeat() {
-        if (emitters.isEmpty()) {
+        if (emitterList.isEmpty()) {
             return;
         }
 
@@ -87,18 +107,45 @@ public class TrackSseBroadcaster {
                 .name("heartbeat")
                 .data(heartbeat);
 
-        emitters.entrySet().removeIf(entry -> {
+        List<SseEmitter> failed = null;
+
+        for (SseEmitter emitter : emitterList) {
             try {
-                entry.getValue().send(event);
-                return false;
+                emitter.send(event);
             } catch (IOException e) {
-                entry.getValue().completeWithError(e);
-                return true;
+                if (failed == null) {
+                    failed = new ArrayList<>(4);
+                }
+                failed.add(emitter);
+            }
+        }
+
+        if (failed != null) {
+            for (SseEmitter failedEmitter : failed) {
+                evictEmitter(failedEmitter);
+            }
+        }
+    }
+
+    private void evictEmitter(SseEmitter emitter) {
+        List<Map.Entry<String, SseEmitter>> toRemove = new ArrayList<>(1);
+        emitterRegistry.forEachEntry(1, entry -> {
+            if (entry.getValue() == emitter) {
+                toRemove.add(entry);
             }
         });
+
+        for (Map.Entry<String, SseEmitter> entry : toRemove) {
+            removeEmitter(entry.getKey(), emitter, "send_failed");
+        }
+
+        try {
+            emitter.completeWithError(new IOException("evicted"));
+        } catch (Exception ignored) {
+        }
     }
 
     public int getConnectedClients() {
-        return emitters.size();
+        return clientCount.get();
     }
 }
