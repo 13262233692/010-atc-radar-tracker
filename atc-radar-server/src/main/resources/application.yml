@@ -1,0 +1,36 @@
+server:
+  port: 8080
+  servlet:
+    context-path: /api
+
+spring:
+  application:
+    name: atc-radar-server
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 5000ms
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 0
+
+atc:
+  radar:
+    udp:
+      port: ${RADAR_UDP_PORT:8600}
+      buffer-size: 65535
+    sse:
+      heartbeat-interval: 15000
+    track:
+      ttl-seconds: 300
+  simulator:
+    enabled: true
+
+logging:
+  level:
+    com.atc.radar: DEBUG
+    org.springframework.data.redis: INFO
